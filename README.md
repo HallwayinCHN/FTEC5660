@@ -54,19 +54,23 @@ homework runner.
 flowchart LR
     A[Receipt images in the selected folder] --> B[Encode each image as a data URL]
     B --> C[DeepSeek vision extraction via LangChain]
-    C --> D[Parse subtotal, rounding, final payment, and discount lines]
+    C --> D[Parse summary, discounts, and positive item charges]
     D --> E[Use Decimal to sum final payments]
-    D --> F[Use Decimal to sum subtotals plus discounts]
+    D --> F[Cross-check original totals and reread mismatches]
+    F --> I[Use Decimal to sum original totals]
     E --> G[Two single-amount HKD answers]
-    F --> G
+    I --> G
     G --> H[Provided runner writes results.csv]
 ```
 
 The chain sends each receipt separately to the required DeepSeek vision model through
-LangChain and asks for structured values from the transaction portion of the image.
+LangChain in non-thinking mode at temperature zero and asks for structured values
+from the transaction portion of the image.
 It distinguishes the subtotal from the final payment after rounding, and extracts
 each negative promotion, coupon, member, app, percentage, or packaging-damage line
-once, without treating rounding as a discount. The program parses these amounts as
-`Decimal`, adds the final payments for the first question, and adds subtotals plus
-discount magnitudes for the second. It returns exactly one HKD amount for each of
-the two fixed queries, so the provided runner can write and grade `results.csv`.
+once, without treating rounding as a discount. It also extracts the positive
+item charges to cross-check the original total and rereads inconsistent receipts.
+The program parses amounts as `Decimal`, sums final payments for the first
+question, and uses subtotals plus discount magnitudes, checked against positive
+item charges, for the second. It returns exactly one HKD amount for each fixed
+query, so the provided runner can write and grade `results.csv`.

@@ -67,6 +67,8 @@ def build_chain() -> Any:
 
     return ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+        extra_body={"thinking": {"type": "disabled"}},
         timeout=90,
         max_retries=2,
     )
@@ -85,11 +87,12 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
+    from collections import Counter
     from langchain_core.messages import HumanMessage
 
     instructions = (
         "Read the attached supermarket receipt image. Return ONLY a JSON object "
-        "with keys subtotal, rounding, paid, and discounts. Every monetary value "
+        "with keys subtotal, rounding, paid, discounts, and item_charges. Every monetary value "
         "must be a decimal string in HKD, without a dollar sign or commas. "
         "subtotal is the printed SUBTOTAL / 小計 after discounts but before "
         "ROUNDING. rounding is the signed amount on the ROUNDING line, or "
@@ -102,13 +105,19 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
         "SUBTOTAL. Read the actual right-hand amount column. Do not count a "
         "discount twice when its amount also appears in its description. "
         "Never include ROUNDING in discounts. Include zero-valued discounts "
-        "as zero or omit them. Example: a subtotal of 102.31, ROUNDING -0.01, "
+        "as zero or omit them. item_charges is an array of the positive item "
+        "and fee amounts in the right-hand column BEFORE SUBTOTAL, one amount "
+        "per charged line, including bag charges. Do not include the SUBTOTAL, "
+        "payment, quantities, unit prices, or numbers inside descriptions. "
+        "Check that the sum of item_charges equals subtotal plus discounts. "
+        "Example: item charges 10.00, 36.90, 60.80, subtotal 102.31, ROUNDING -0.01, "
         "OCTOPUS 102.30, and one 5%-off line -5.39 gives "
         '{"subtotal":"102.31","rounding":"-0.01","paid":"102.30",'
-        '"discounts":["5.39"]}. No markdown or explanation.'
+        '"discounts":["5.39"],"item_charges":["10.00","36.90","60.80"]}. '
+        "No markdown or explanation."
     )
 
-    def parse_receipt(response: Any) -> tuple[Decimal, Decimal, Decimal]:
+    def parse_receipt(response: Any) -> dict[str, Decimal]:
         content = response_text(response)
         start, end = content.find("{"), content.rfind("}")
         if start < 0 or end < start:
@@ -123,36 +132,65 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
         rounding = money(data["rounding"])
         paid = money(data["paid"])
         discounts = data["discounts"]
-        if not isinstance(discounts, list):
-            raise ValueError("discounts must be a list")
+        item_charges = data["item_charges"]
+        if not isinstance(discounts, list) or not isinstance(item_charges, list):
+            raise ValueError("discounts and item_charges must be lists")
         discount_total = sum((money(value) for value in discounts), Decimal("0.00"))
-        if any(money(value) < 0 for value in discounts):
-            raise ValueError("discount magnitudes must be positive")
-        return paid, subtotal + discount_total, subtotal + rounding
+        item_total = sum((money(value) for value in item_charges), Decimal("0.00"))
+        if any(money(value) < 0 for value in discounts + item_charges):
+            raise ValueError("discount and item magnitudes must be positive")
+        return {
+            "paid": paid,
+            "paid_from_summary": subtotal + rounding,
+            "original_from_discounts": subtotal + discount_total,
+            "original_from_items": item_total,
+        }
 
     total_paid = Decimal("0.00")
     total_without_discounts = Decimal("0.00")
     for path in images:
-        message = HumanMessage(content=[
-            {"type": "text", "text": instructions},
-            {"type": "image_url", "image_url": {"url": image_data_url(path)}},
-        ])
-        reply = chain.invoke([message])
+        image_url = image_data_url(path)
+
+        def extract(prompt: str) -> dict[str, Decimal]:
+            message = HumanMessage(content=[
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ])
+            return parse_receipt(chain.invoke([message]))
+
         try:
-            paid, original, calculated_paid = parse_receipt(reply)
+            first = extract(instructions)
         except (ValueError, KeyError, TypeError, InvalidOperation):
-            retry = HumanMessage(content=[
-                {"type": "text", "text": instructions + " Your previous answer could not be parsed; return valid JSON with all four keys."},
-                {"type": "image_url", "image_url": {"url": image_data_url(path)}},
-            ])
-            paid, original, calculated_paid = parse_receipt(chain.invoke([retry]))
-        if paid != calculated_paid:
-            # Confirm inconsistent amounts against the image once more.
-            check = HumanMessage(content=[
-                {"type": "text", "text": instructions + " Verify the subtotal, ROUNDING, and final paid lines carefully; your previous values did not reconcile."},
-                {"type": "image_url", "image_url": {"url": image_data_url(path)}},
-            ])
-            paid, original, _ = parse_receipt(chain.invoke([check]))
+            first = extract(instructions + " Return valid JSON with all five keys.")
+
+        readings = [first]
+        if (first["paid"] != first["paid_from_summary"] or
+                first["original_from_discounts"] != first["original_from_items"]):
+            readings.append(extract(
+                instructions + " Your first extraction did not reconcile. "
+                "Re-read the right-hand amount column carefully, counting each "
+                "discount once and each charged item once."
+            ))
+
+        paid = next(
+            (r["paid"] for r in readings if r["paid"] == r["paid_from_summary"]),
+            readings[-1]["paid"],
+        )
+        candidates = [r[key] for r in readings for key in
+                      ("original_from_discounts", "original_from_items")]
+        counts = Counter(candidates)
+        if len(counts) > 1 and len(set(counts.values())) == 1:
+            third = extract(
+                instructions + " Independently verify the item charges and every "
+                "negative discount line; the earlier readings disagreed."
+            )
+            readings.append(third)
+            candidates.extend((third["original_from_discounts"], third["original_from_items"]))
+            counts = Counter(candidates)
+        ranked = counts.most_common()
+        original = (readings[-1]["original_from_items"]
+                    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]
+                    else ranked[0][0])
         total_paid += paid
         total_without_discounts += original
 
