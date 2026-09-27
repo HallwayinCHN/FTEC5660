@@ -48,6 +48,25 @@ DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
 
-## Homework 1 solution: 
-> to students: please fill your solution description here.
+## Homework 1 solution
 
+```mermaid
+flowchart LR
+    A[Receipt images in the selected folder] --> B[Encode each image as a data URL]
+    B --> C[DeepSeek vision extraction via LangChain]
+    C --> D[Parse subtotal, rounding, final payment, and discount lines]
+    D --> E[Use Decimal to sum final payments]
+    D --> F[Use Decimal to sum subtotals plus discounts]
+    E --> G[Two single-amount HKD answers]
+    F --> G
+    G --> H[Provided runner writes results.csv]
+```
+
+The chain sends each receipt separately to the required DeepSeek vision model through
+LangChain and asks for structured values from the transaction portion of the image.
+It distinguishes the subtotal from the final payment after rounding, and extracts
+each negative promotion, coupon, member, app, percentage, or packaging-damage line
+once, without treating rounding as a discount. The program parses these amounts as
+`Decimal`, adds the final payments for the first question, and adds subtotals plus
+discount magnitudes for the second. It returns exactly one HKD amount for each of
+the two fixed queries, so the provided runner can write and grade `results.csv`.

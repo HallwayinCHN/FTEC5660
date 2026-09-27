@@ -63,7 +63,13 @@ def build_chain() -> Any:
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        timeout=90,
+        max_retries=2,
+    )
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -79,8 +85,81 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    from langchain_core.messages import HumanMessage
+
+    instructions = (
+        "Read the attached supermarket receipt image. Return ONLY a JSON object "
+        "with keys subtotal, rounding, paid, and discounts. Every monetary value "
+        "must be a decimal string in HKD, without a dollar sign or commas. "
+        "subtotal is the printed SUBTOTAL / 小計 after discounts but before "
+        "ROUNDING. rounding is the signed amount on the ROUNDING line, or "
+        "'0.00' if there is no such line. paid is the final amount charged "
+        "after rounding, often on an OCTOPUS, VISA, or CASH line. Ignore "
+        "change, card balance, points, dates, and duplicate payment details. "
+        "discounts is an array of positive decimal strings: one for EACH "
+        "negative discount, promotion, coupon, member, app, percentage-off, "
+        "or packaging-damage amount printed in the item section BEFORE "
+        "SUBTOTAL. Read the actual right-hand amount column. Do not count a "
+        "discount twice when its amount also appears in its description. "
+        "Never include ROUNDING in discounts. Include zero-valued discounts "
+        "as zero or omit them. Example: a subtotal of 102.31, ROUNDING -0.01, "
+        "OCTOPUS 102.30, and one 5%-off line -5.39 gives "
+        '{"subtotal":"102.31","rounding":"-0.01","paid":"102.30",'
+        '"discounts":["5.39"]}. No markdown or explanation.'
+    )
+
+    def parse_receipt(response: Any) -> tuple[Decimal, Decimal, Decimal]:
+        content = response_text(response)
+        start, end = content.find("{"), content.rfind("}")
+        if start < 0 or end < start:
+            raise ValueError(f"Model did not return JSON: {content[:200]!r}")
+        data = json.loads(content[start : end + 1])
+
+        def money(value: Any) -> Decimal:
+            amount = Decimal(str(value).replace("HK$", "").replace("$", "").replace(",", ""))
+            return amount.quantize(Decimal("0.01"))
+
+        subtotal = money(data["subtotal"])
+        rounding = money(data["rounding"])
+        paid = money(data["paid"])
+        discounts = data["discounts"]
+        if not isinstance(discounts, list):
+            raise ValueError("discounts must be a list")
+        discount_total = sum((money(value) for value in discounts), Decimal("0.00"))
+        if any(money(value) < 0 for value in discounts):
+            raise ValueError("discount magnitudes must be positive")
+        return paid, subtotal + discount_total, subtotal + rounding
+
+    total_paid = Decimal("0.00")
+    total_without_discounts = Decimal("0.00")
+    for path in images:
+        message = HumanMessage(content=[
+            {"type": "text", "text": instructions},
+            {"type": "image_url", "image_url": {"url": image_data_url(path)}},
+        ])
+        reply = chain.invoke([message])
+        try:
+            paid, original, calculated_paid = parse_receipt(reply)
+        except (ValueError, KeyError, TypeError, InvalidOperation):
+            retry = HumanMessage(content=[
+                {"type": "text", "text": instructions + " Your previous answer could not be parsed; return valid JSON with all four keys."},
+                {"type": "image_url", "image_url": {"url": image_data_url(path)}},
+            ])
+            paid, original, calculated_paid = parse_receipt(chain.invoke([retry]))
+        if paid != calculated_paid:
+            # Confirm inconsistent amounts against the image once more.
+            check = HumanMessage(content=[
+                {"type": "text", "text": instructions + " Verify the subtotal, ROUNDING, and final paid lines carefully; your previous values did not reconcile."},
+                {"type": "image_url", "image_url": {"url": image_data_url(path)}},
+            ])
+            paid, original, _ = parse_receipt(chain.invoke([check]))
+        total_paid += paid
+        total_without_discounts += original
+
+    return {
+        QUERY_1: f"HK${total_paid:.2f}",
+        QUERY_2: f"HK${total_without_discounts:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
